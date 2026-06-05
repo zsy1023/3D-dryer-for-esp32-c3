@@ -1,0 +1,746 @@
+﻿// main.cpp -- 3D打印耗材烘干箱控制系统
+// 主控芯片: ESP32-C3
+// 控制对象: 加热片(IO4) + 12V风扇(IO5)
+// 温度传感器: DS18B20 (IO13)
+// 网络: WiFi + Web + Blinker
+// ============================================================
+// 开发平台: VS Code + PlatformIO
+// 框架: Arduino (espressif32)
+// Serial 默认使用 UART0 (GPIO20/21)
+// ============================================================
+
+#include "config.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ==================== 全局对象 ====================
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+WebServer server(80);
+Preferences prefs;
+
+// ==================== 全局变量 ====================
+float currentTemp = 0.0;
+bool sensorOK = false;
+int sensorFailCount = 0;
+bool sensorFault = false;
+
+int targetTemp = DEFAULT_TARGET_TEMP;
+int dryTime = DEFAULT_DRY_TIME;
+int remainingSeconds = 0;
+
+SystemState systemState = STATE_STANDBY;
+bool heaterRelay = false;
+bool fanRelay = false;
+
+unsigned long dryStartMillis = 0;
+bool overheatActive = false;
+
+bool wifiConnected = false;
+String blinkerAuthKey = "";
+bool blinkerInited = false;
+unsigned long lastBlinkerPush = 0;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastWebHandle = 0;
+
+// 手动控制模式（无视传感器故障）
+bool manualMode = false;
+bool manualHeater = false;
+bool manualFan = false;
+
+// ==================== 函数声明 ====================
+void initHardware();
+void loadParameters();
+void saveIntParam(const char* key, int value);
+void saveStringParam(const char* key, const String& value);
+int loadIntParam(const char* key, int defaultValue);
+String loadStringParam(const char* key, const String& defaultValue);
+void setupWiFi();
+void checkWiFi();
+void readTemperature();
+void checkOverheatProtection();
+void checkSensorFault();
+void setRelays(bool heater, bool fan);
+void runStateMachine();
+void startDrying();
+void stopDrying();
+void enterCooling(bool overheat = false);
+void setupWebServer();
+void handleRoot();
+void handleApiStatus();
+void handleApiControl();
+void handleConfigPage();
+void handleApiSaveConfig();
+void handleNotFound();
+void handleApiManual();
+void setupBlinker();
+void pushBlinkerData();
+void blinkerButtonCallback(const String& state);
+void blinkerSliderTempCallback(int32_t value);
+void blinkerSliderTimeCallback(int32_t value);
+String formatTime(int totalSeconds);
+String getStateString();
+String getMainPageHTML();
+String getConfigPageHTML();
+
+// ============================================================
+// setup()
+// ============================================================
+void setup() {
+    // 初始化串口
+    Serial.begin(115200);
+
+    // 引脚初始化（只设GPIO模式，不碰传感器）
+    pinMode(HEATER_PIN, OUTPUT);
+    pinMode(FAN_PIN, OUTPUT);
+    digitalWrite(HEATER_PIN, LOW);
+    digitalWrite(FAN_PIN, LOW);
+
+    // 启动WiFi（不等待）
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // 立即启动Web服务器
+    server.on("/", handleRoot);
+    server.on("/api/status", handleApiStatus);
+    server.on("/api/control", HTTP_POST, handleApiControl);
+    server.on("/config", handleConfigPage);
+    server.on("/api/save_config", HTTP_POST, handleApiSaveConfig);
+    server.on("/api/manual", HTTP_POST, handleApiManual);
+    server.onNotFound(handleNotFound);
+    server.begin();
+
+    // 加载参数
+    loadParameters();
+
+    // 初始化硬件（传感器、继电器）
+    initHardware();
+
+    // 初始化Blinker（如果有配置）
+    // setupBlinker();  // 暂时注释掉排查问题
+
+    // 标记传感器初始化待完成
+    lastSensorRead = millis() + 3000; // 延迟3秒再开始读传感器
+
+    Serial.println("[系统] 初始化完成，进入主循环");
+}
+
+// ============================================================
+// loop()
+// ============================================================
+void loop() {
+    unsigned long now = millis();
+
+    if (now - lastWebHandle >= WEB_CHECK_INTERVAL) {
+        server.handleClient();
+        lastWebHandle = now;
+    }
+
+    // if (blinkerInited) {
+    //     Blinker.run();
+    // }
+
+    if (now - lastSensorRead >= SENSOR_READ_INTERVAL) {
+        readTemperature();
+        lastSensorRead = now;
+
+        if (sensorOK) {
+            Serial.printf("[传感器] 温度: %.1fC | 状态: %s | 加热: %s | 风扇: %s\n",
+                currentTemp, getStateString().c_str(),
+                heaterRelay ? "ON" : "OFF", fanRelay ? "ON" : "OFF");
+        }
+    }
+
+    checkWiFi();
+    checkOverheatProtection();
+    checkSensorFault();
+
+    if (manualMode) {
+        // 手动控制模式：无视传感器，直接设继电器
+        setRelays(manualHeater, manualFan);
+    } else if (!overheatActive && !sensorFault) {
+        runStateMachine();
+    } else if (sensorFault) {
+        // 传感器故障时只关加热（不强制开风扇），便于手动干预
+        setRelays(false, fanRelay);
+    }
+
+    // if (blinkerInited && (now - lastBlinkerPush >= BLINKER_PUSH_INTERVAL)) {
+    //     pushBlinkerData();
+    //     lastBlinkerPush = now;
+    // }
+}
+
+// ============================================================
+// 硬件初始化
+// ============================================================
+void initHardware() {
+    Serial.println("[硬件] 初始化引脚...");
+    pinMode(HEATER_PIN, OUTPUT);
+    pinMode(FAN_PIN, OUTPUT);
+    digitalWrite(HEATER_PIN, LOW);
+    digitalWrite(FAN_PIN, LOW);
+    heaterRelay = false;
+    fanRelay = false;
+
+    // DS18B20 初始化（带超时，防止无传感器时卡死）
+    unsigned long start = millis();
+    ds18b20.begin();
+    while (ds18b20.getDeviceCount() == 0 && millis() - start < 2000) {
+        delay(10);
+        ds18b20.begin();
+    }
+    if (ds18b20.getDeviceCount() == 0) {
+        Serial.println("[硬件] 未检测到 DS18B20 传感器");
+    } else {
+        Serial.printf("[硬件] 检测到 %d 个 DS18B20 传感器\n", ds18b20.getDeviceCount());
+    }
+
+    Serial.println("[硬件] 初始化完成 (加热片: OFF, 风扇: OFF)");
+}
+
+// ============================================================
+// 参数持久化
+// ============================================================
+void loadParameters() {
+    prefs.begin(PREF_NAMESPACE, false);
+    targetTemp = loadIntParam(PREF_KEY_TARGET_TEMP, DEFAULT_TARGET_TEMP);
+    dryTime = loadIntParam(PREF_KEY_DRY_TIME, DEFAULT_DRY_TIME);
+    blinkerAuthKey = loadStringParam(PREF_KEY_BLINKER_AUTH, "");
+
+    if (targetTemp < 0) targetTemp = 0;
+    if (targetTemp > 100) targetTemp = 100;
+    if (dryTime < 1) dryTime = 1;
+    if (dryTime > 999) dryTime = 999;
+
+    Serial.printf("[参数] 目标温度: %dC, 烘干时间: %d分钟\n", targetTemp, dryTime);
+    if (blinkerAuthKey.length() > 0) {
+        Serial.println("[参数] Blinker Auth Key: 已配置");
+    } else {
+        Serial.println("[参数] Blinker Auth Key: 未配置");
+    }
+    prefs.end();
+}
+
+void saveIntParam(const char* key, int value) {
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putInt(key, value);
+    prefs.end();
+}
+
+void saveStringParam(const char* key, const String& value) {
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putString(key, value);
+    prefs.end();
+}
+
+int loadIntParam(const char* key, int defaultValue) {
+    return prefs.getInt(key, defaultValue);
+}
+
+String loadStringParam(const char* key, const String& defaultValue) {
+    return prefs.getString(key, defaultValue);
+}
+
+// ============================================================
+// WiFi
+// ============================================================
+void setupWiFi() {
+    Serial.printf("[WiFi] 正在连接 %s ...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    int timeout = 40;
+    while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+        delay(500);
+        Serial.print(".");
+        timeout--;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println();
+        Serial.printf("[WiFi] 连接成功! IP: %s\n", WiFi.localIP().toString().c_str());
+        WiFi.setAutoReconnect(true);
+    } else {
+        wifiConnected = false;
+        Serial.println();
+        Serial.println("[WiFi] 连接失败，将在后台重连");
+        WiFi.setAutoReconnect(true);
+    }
+}
+
+void checkWiFi() {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (wifiConnected) {
+            Serial.println("[WiFi] 连接断开，正在重连...");
+            wifiConnected = false;
+        }
+    } else {
+        if (!wifiConnected) {
+            wifiConnected = true;
+            Serial.printf("[WiFi] 重新连接成功! IP: %s\n", WiFi.localIP().toString().c_str());
+        }
+    }
+}
+
+// ============================================================
+// DS18B20
+// ============================================================
+void readTemperature() {
+    ds18b20.requestTemperatures();
+    float temp = ds18b20.getTempCByIndex(0);
+
+    if (temp == DEVICE_DISCONNECTED_C) {
+        sensorOK = false;
+        sensorFailCount++;
+        Serial.printf("[传感器] 读取失败 (%d/%d)\n", sensorFailCount, SENSOR_FAULT_THRESHOLD);
+    } else {
+        currentTemp = temp;
+        sensorOK = true;
+        sensorFailCount = 0;
+        if (sensorFault) {
+            sensorFault = false;
+            Serial.println("[传感器] 故障已恢复");
+        }
+    }
+}
+
+// ============================================================
+// 过热保护
+// ============================================================
+void checkOverheatProtection() {
+    if (!sensorOK) return;
+    if (!overheatActive) {
+        if (currentTemp >= OVERHEAT_TRIGGER_TEMP) {
+            overheatActive = true;
+            Serial.printf("[保护] 过热! %.1fC >= %dC, 强制散热!\n", currentTemp, OVERHEAT_TRIGGER_TEMP);
+            enterCooling(true);
+        }
+    } else {
+        if (currentTemp <= OVERHEAT_RELEASE_TEMP) {
+            overheatActive = false;
+            Serial.printf("[保护] 过热解除! %.1fC <= %dC\n", currentTemp, OVERHEAT_RELEASE_TEMP);
+            if (systemState == STATE_COOLING) {
+                setRelays(false, false);
+                systemState = STATE_STANDBY;
+                Serial.println("[状态机] 过热解除 -> 待机");
+            }
+        }
+    }
+}
+
+// ============================================================
+// 传感器故障
+// ============================================================
+void checkSensorFault() {
+    if (!sensorFault && sensorFailCount >= SENSOR_FAULT_THRESHOLD) {
+        sensorFault = true;
+        Serial.println("[保护] 传感器故障!");
+        if (!manualMode) {
+            setRelays(false, true);
+            systemState = STATE_STANDBY;
+        } else {
+            Serial.println("[保护] 手动模式中，不强制干预");
+        }
+    }
+}
+
+// ============================================================
+// 继电器
+// ============================================================
+void setRelays(bool heater, bool fan) {
+    if (heater != heaterRelay) {
+        digitalWrite(HEATER_PIN, heater ? HIGH : LOW);
+        heaterRelay = heater;
+        Serial.printf("[继电器] 加热: %s\n", heater ? "ON" : "OFF");
+    }
+    if (fan != fanRelay) {
+        digitalWrite(FAN_PIN, fan ? HIGH : LOW);
+        fanRelay = fan;
+        Serial.printf("[继电器] 风扇: %s\n", fan ? "ON" : "OFF");
+    }
+}
+
+// ============================================================
+// 状态机
+// ============================================================
+void runStateMachine() {
+    unsigned long now = millis();
+
+    switch (systemState) {
+        case STATE_STANDBY:
+            setRelays(false, false);
+            remainingSeconds = 0;
+            break;
+
+        case STATE_DRYING: {
+            if (sensorOK) {
+                float heatOnTemp = targetTemp - HYSTERESIS;
+                float heatOffTemp = targetTemp + HYSTERESIS;
+                if (currentTemp < heatOnTemp) setRelays(true, true);
+                else if (currentTemp > heatOffTemp) setRelays(false, true);
+            } else {
+                setRelays(heaterRelay, true);
+            }
+
+            unsigned long elapsed = (now - dryStartMillis) / 1000;
+            int totalSeconds = dryTime * 60;
+            if (elapsed >= (unsigned long)totalSeconds) {
+                Serial.println("[状态机] 烘干完成 -> 散热");
+                enterCooling(false);
+            } else {
+                remainingSeconds = totalSeconds - elapsed;
+            }
+            break;
+        }
+
+        case STATE_COOLING:
+            setRelays(false, true);
+            if (sensorOK && currentTemp <= COOLING_TARGET_TEMP) {
+                Serial.printf("[状态机] 散热完成! %.1fC <= %dC -> 待机\n", currentTemp, COOLING_TARGET_TEMP);
+                setRelays(false, false);
+                systemState = STATE_STANDBY;
+                remainingSeconds = 0;
+            }
+            break;
+    }
+}
+
+// ============================================================
+// 开始/停止
+// ============================================================
+void startDrying() {
+    if (sensorFault) { Serial.println("[控制] 传感器故障, 禁止启动!"); return; }
+    if (overheatActive) { Serial.println("[控制] 过热保护中, 禁止启动!"); return; }
+    if (systemState == STATE_DRYING) { Serial.println("[控制] 已在烘干状态"); return; }
+
+    Serial.printf("[控制] >> 开始烘干! %dC, %d分钟\n", targetTemp, dryTime);
+    systemState = STATE_DRYING;
+    dryStartMillis = millis();
+    remainingSeconds = dryTime * 60;
+    setRelays(false, true);
+    Serial.println("[状态机] -> 烘干中");
+}
+
+void stopDrying() {
+    if (systemState == STATE_DRYING) {
+        Serial.println("[控制] || 停止 -> 散热");
+        enterCooling(false);
+    } else if (systemState == STATE_COOLING) {
+        Serial.println("[控制] || 停止散热 -> 待机");
+        setRelays(false, false);
+        systemState = STATE_STANDBY;
+        remainingSeconds = 0;
+    } else {
+        Serial.println("[控制] 无需停止");
+    }
+}
+
+void enterCooling(bool overheat) {
+    systemState = STATE_COOLING;
+    setRelays(false, true);
+    remainingSeconds = 0;
+    Serial.printf("[状态机] -> 散热中%s\n", overheat ? " (过热)" : "");
+}
+
+// ============================================================
+// Web 服务器
+// ============================================================
+void setupWebServer() {
+    server.on("/", handleRoot);
+    server.on("/api/status", handleApiStatus);
+    server.on("/api/control", HTTP_POST, handleApiControl);
+    server.on("/config", handleConfigPage);
+    server.on("/api/save_config", HTTP_POST, handleApiSaveConfig);
+    server.onNotFound(handleNotFound);
+
+    // 等待WiFi获取IP（最多5秒），确保server.begin()绑定成功
+    int wait = 10;
+    while (WiFi.status() != WL_CONNECTED && wait > 0) {
+        delay(500);
+        wait--;
+    }
+
+    server.begin();
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (wifiConnected) {
+        Serial.print("[Web] http://");
+        Serial.println(WiFi.localIP().toString());
+    } else {
+        Serial.println("[Web] WiFi未连接，服务器将在连网后生效");
+    }
+}
+
+void handleRoot() {
+    server.send(200, "text/html; charset=utf-8", getMainPageHTML());
+}
+
+void handleApiStatus() {
+    String json = "{";
+    json += "\"temp\":" + String(currentTemp, 1) + ",";
+    json += "\"state\":" + String((int)systemState) + ",";
+    json += "\"stateStr\":\"" + getStateString() + "\",";
+    json += "\"remaining\":" + String(remainingSeconds) + ",";
+    json += "\"remainingStr\":\"" + formatTime(remainingSeconds) + "\",";
+    json += "\"targetTemp\":" + String(targetTemp) + ",";
+    json += "\"dryTime\":" + String(dryTime) + ",";
+    json += "\"heater\":" + String(heaterRelay ? 1 : 0) + ",";
+    json += "\"fan\":" + String(fanRelay ? 1 : 0) + ",";
+    json += "\"fault\":" + String(sensorFault ? 1 : 0) + ",";
+    json += "\"overheat\":" + String(overheatActive ? 1 : 0) + ",";
+    json += "\"manual\":" + String(manualMode ? 1 : 0) + ",";
+    json += "\"mHeat\":" + String(manualHeater ? 1 : 0) + ",";
+    json += "\"mFan\":" + String(manualFan ? 1 : 0);
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handleApiControl() {
+    bool success = false;
+    String msg = "";
+    if (server.hasArg("cmd")) {
+        String cmd = server.arg("cmd");
+        if (server.hasArg("targetTemp")) {
+            int newTemp = server.arg("targetTemp").toInt();
+            if (newTemp >= 0 && newTemp <= 100) {
+                targetTemp = newTemp;
+                saveIntParam(PREF_KEY_TARGET_TEMP, targetTemp);
+            }
+        }
+        if (server.hasArg("dryTime")) {
+            int newTime = server.arg("dryTime").toInt();
+            if (newTime >= 1 && newTime <= 999) {
+                dryTime = newTime;
+                saveIntParam(PREF_KEY_DRY_TIME, dryTime);
+            }
+        }
+        if (cmd == "start") { startDrying(); success = true; msg = "start"; }
+        else if (cmd == "stop") { stopDrying(); success = true; msg = "stop"; }
+        else { msg = "unknown"; }
+    }
+    String json = "{\"success\":" + String(success ? "true" : "false") + ",\"msg\":\"" + msg + "\"}";
+    server.send(200, "application/json", json);
+}
+
+void handleConfigPage() {
+    server.send(200, "text/html; charset=utf-8", getConfigPageHTML());
+}
+
+void handleApiSaveConfig() {
+    String msg = "";
+    bool success = false;
+    if (server.hasArg("authKey")) {
+        String newAuthKey = server.arg("authKey");
+        newAuthKey.trim();
+        if (newAuthKey.length() > 0) {
+            saveStringParam(PREF_KEY_BLINKER_AUTH, newAuthKey);
+            blinkerAuthKey = newAuthKey;
+            msg = "saved, rebooting...";
+            success = true;
+        } else {
+            saveStringParam(PREF_KEY_BLINKER_AUTH, "");
+            blinkerAuthKey = "";
+            msg = "cleared, rebooting...";
+            success = true;
+        }
+    }
+    String html = "<!DOCTYPE html><html><body style='font-family:sans-serif;padding:20px'>";
+    html += "<h2>" + String(success ? "OK" : "FAIL") + "</h2><p>" + msg + "</p>";
+    html += "<script>setTimeout(function(){location.href='/';},2000);</script></body></html>";
+    server.send(200, "text/html", html);
+    delay(500);
+    ESP.restart();
+}
+
+void handleNotFound() {
+    server.send(404, "text/plain", "404");
+}
+
+// ============================================================
+// 手动控制 API
+// ============================================================
+void handleApiManual() {
+    if (server.hasArg("mode")) {
+        manualMode = server.arg("mode").toInt();
+    }
+    if (manualMode) {
+        if (server.hasArg("heater")) {
+            manualHeater = server.arg("heater").toInt();
+        }
+        if (server.hasArg("fan")) {
+            manualFan = server.arg("fan").toInt();
+        }
+    }
+    String json = "{\"manual\":" + String(manualMode ? 1 : 0) + ",\"mHeat\":" + String(manualHeater ? 1 : 0) + ",\"mFan\":" + String(manualFan ? 1 : 0) + "}";
+    server.send(200, "application/json", json);
+}
+
+// ============================================================
+// Blinker 已停用
+// ============================================================
+
+// ============================================================
+// 工具函数
+// ============================================================
+String formatTime(int totalSeconds) {
+    if (totalSeconds <= 0) return "00:00";
+    int m = totalSeconds / 60;
+    int s = totalSeconds % 60;
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+    return String(buf);
+}
+
+String getStateString() {
+    if (sensorFault) return "传感器故障";
+    if (overheatActive) return "过热保护中";
+    switch (systemState) {
+        case STATE_STANDBY:  return "待机";
+        case STATE_DRYING:   return "烘干中";
+        case STATE_COOLING:  return "散热中";
+        default: return "未知";
+    }
+}
+
+// ============================================================
+// HTML: 主页面
+// ============================================================
+String getMainPageHTML() {
+    return R"rawliteral(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>烘干箱</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px}
+.c{max-width:480px;margin:0 auto}
+.card{background:#fff;border-radius:16px;padding:20px;margin-bottom:12px}
+.t{font-size:56px;font-weight:bold;text-align:center}
+.s{text-align:center;font-size:18px;margin:8px 0}
+.r{text-align:center;font-size:32px;font-weight:bold}
+.l{font-size:13px;color:#999}
+.row{display:flex;gap:12px}
+.col{flex:1}
+.inp{width:100%;padding:12px;border:2px solid #ddd;border-radius:10px;font-size:16px}
+.btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer;margin:6px 0}
+.g{background:#4CAF50;color:#fff}
+.r2{background:#f44336;color:#fff}
+.b{background:#2196F3;color:#fff}
+.h{display:none}
+.al{text-align:center;margin-top:12px}
+.al a{color:#2196F3}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="card">
+<div class="t"><span id="t">--</span>&deg;C</div>
+<div class="s"><span id="s">连接中...</span></div>
+<div class="l" style="margin-top:8px">剩余时间</div>
+<div class="r" id="r">--:--</div>
+<div style="margin-top:8px;font-size:14px;color:#666"><span id="h">加热 OFF</span> <span id="f" style="margin-left:16px">风扇 OFF</span></div>
+</div>
+<div class="card">
+<div class="row">
+<div class="col"><div class="l">温度 (&deg;C)</div><input class="inp" type="number" id="tt" min="0" max="100"></div>
+<div class="col"><div class="l">时间 (分钟)</div><input class="inp" type="number" id="dt" min="1" max="999"></div>
+</div>
+<button class="btn g" id="bs" onclick="c('start')">开始</button>
+<button class="btn r2 h" id="bp" onclick="c('stop')">停止</button>
+</div>
+<div id="b"></div>
+<div class="card">
+<div class="l">手动控制（故障时可强制开关）</div>
+<div style="margin:8px 0">
+<label><input type="checkbox" id="manualMode" onchange="toggleManual()"> 无视传感器故障</label>
+</div>
+<div id="manualCtl" class="h">
+<button class="btn g" id="mhBtn" onclick="manual('heater',1)">加热 ON</button>
+<button class="btn r2 h" id="mhOff" onclick="manual('heater',0)">加热 OFF</button>
+<button class="btn b" id="mfBtn" onclick="manual('fan',1)">风扇 ON</button>
+<button class="btn r2 h" id="mfOff" onclick="manual('fan',0)">风扇 OFF</button>
+</div>
+</div>
+<div class="al"><a href="/config">Blinker 配置</a></div>
+</div>
+<script>
+function manual(cmd,val){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+(document.getElementById('manualMode').checked?1:0)+'&'+cmd+'='+val}).then(function(r){return r.json()}).then(function(d){p()}).catch(function(){})}
+function toggleManual(){manual('heater',0)}
+function u(d){document.getElementById('t').textContent=d.temp.toFixed(1);
+function u(d){document.getElementById('t').textContent=d.temp.toFixed(1);
+document.getElementById('s').textContent=d.stateStr+(d.fault?' 故障':'')+(d.overheat?' 过热':'');
+document.getElementById('r').textContent=d.remainingStr;
+document.getElementById('h').textContent=d.heater?'加热 ON':'加热 OFF';
+document.getElementById('f').textContent=d.fan?'风扇 ON':'风扇 OFF';
+document.getElementById('tt').value=d.targetTemp;
+document.getElementById('dt').value=d.dryTime;
+if(d.state===0||d.fault||d.overheat){document.getElementById('bs').classList.remove('h');document.getElementById('bp').classList.add('h')}
+else{document.getElementById('bs').classList.add('h');document.getElementById('bp').classList.remove('h')}
+var w='';if(d.fault)w+='<div style="background:#f8d7da;padding:10px;border-radius:8px;margin-bottom:12px">传感器故障</div>';
+if(d.overheat)w+='<div style="background:#fff3cd;padding:10px;border-radius:8px;margin-bottom:12px">过热保护中</div>';
+document.getElementById('b').innerHTML=w;
+document.getElementById('manualMode').checked=d.manual;
+if(d.manual||d.fault){document.getElementById('manualCtl').classList.remove('h')}else{document.getElementById('manualCtl').classList.add('h')}
+var mh=document.getElementById('mhBtn');var mho=document.getElementById('mhOff');var mf=document.getElementById('mfBtn');var mfo=document.getElementById('mfOff');
+if(d.manual){if(d.mHeat){mh.classList.add('h');mho.classList.remove('h')}else{mh.classList.remove('h');mho.classList.add('h')}
+if(d.mFan){mf.classList.add('h');mfo.classList.remove('h')}else{mf.classList.remove('h');mfo.classList.add('h')}}}
+function p(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){u(d)}).catch(function(){})}
+function c(m){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'cmd='+m+'&targetTemp='+document.getElementById('tt').value+'&dryTime='+document.getElementById('dt').value}).then(function(r){return r.json()}).then(function(d){if(d.success)p()}).catch(function(){})}
+setInterval(p,1000);p();
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+// ============================================================
+// HTML: 配置页
+// ============================================================
+String getConfigPageHTML() {
+    return R"rawliteral(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Blinker 配置</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px}
+.c{max-width:480px;margin:0 auto}
+.card{background:#fff;border-radius:16px;padding:20px;margin-bottom:12px}
+.inp{width:100%;padding:12px;border:2px solid #ddd;border-radius:10px;font-size:16px;margin:8px 0}
+.btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer;margin:6px 0}
+.o{background:#FF9800;color:#fff}
+.g2{background:#757575;color:#fff}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="card">
+<h2>Blinker 配置</h2>
+<p style="font-size:14px;color:#666;margin-bottom:8px">在 APP 中添加设备后复制 Auth Key 粘贴到下方</p>
+<form action="/api/save_config" method="post">
+<input class="inp" type="text" name="authKey" placeholder="Auth Key">
+<button class="btn o" type="submit">保存并重启</button>
+</form>
+<a href="/"><button class="btn g2">返回</button></a>
+</div>
+</div>
+</body>
+</html>
+)rawliteral";
+}
+
+// ============================================================
+// 结束
+// ============================================================

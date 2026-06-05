@@ -1,0 +1,58 @@
+// blinker_ctl.cpp - Blinker control, no global constructors
+#include "config.h"
+#define BLINKER_WIFI
+#include <Blinker.h>
+#include "utility/BlinkerSlider.h"
+
+// Pointers only - NO static objects (avoid global constructors before main)
+static BlinkerButton* btnStart = NULL;
+static BlinkerSlider* sldTemp = NULL;
+static BlinkerSlider* sldTime = NULL;
+static BlinkerNumber* numTemp = NULL;
+static BlinkerText* txtState = NULL;
+static BlinkerNumber* numRemain = NULL;
+static bool inited = false;
+
+extern float currentTemp;
+extern bool overheatActive;
+extern bool sensorFault;
+extern int remainingSeconds;
+extern String getStateString();
+extern void startDrying();
+extern void stopDrying();
+extern int targetTemp;
+extern int dryTime;
+#include <Preferences.h>
+static Preferences prefs;
+
+void blinkerBtnCb(const String& state) {
+  if (state == BLINKER_CMD_BUTTON_TAP) {
+    if (inited) startDrying(); else stopDrying();
+  }
+}
+void blinkerTempCb(int32_t value) { if (value >= 0 && value <= 100) { targetTemp = value; prefs.begin("drybox",false); prefs.putInt("targetTemp",targetTemp); prefs.end(); } }
+void blinkerTimeCb(int32_t value) { if (value >= 1 && value <= 240) { dryTime = value; prefs.begin("drybox",false); prefs.putInt("dryTime",dryTime); prefs.end(); } }
+
+void blinkerSetup(const char* authKey) {
+  if (inited) return;
+  btnStart = new BlinkerButton("btn-start"); btnStart->attach(blinkerBtnCb);
+  sldTemp = new BlinkerSlider("sld-temp"); sldTemp->attach(blinkerTempCb);
+  sldTime = new BlinkerSlider("sld-time"); sldTime->attach(blinkerTimeCb);
+  numTemp = new BlinkerNumber("num-temp");
+  txtState = new BlinkerText("txt-state");
+  numRemain = new BlinkerNumber("num-remain");
+  Blinker.begin(authKey);
+  inited = true;
+}
+
+void blinkerRun() { if (inited) Blinker.run(); }
+
+void blinkerPush() {
+  if (!inited) return;
+  if (numTemp) numTemp->print((int)currentTemp);
+  String st = getStateString(); if (overheatActive) st += " OVERTEMP"; if (sensorFault) st += " FAULT";
+  if (txtState) txtState->print(st);
+  if (numRemain) numRemain->print((remainingSeconds + 59) / 60);
+}
+
+bool blinkerIsReady() { return inited; }
