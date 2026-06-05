@@ -1,0 +1,50 @@
+// blinker_ctl.cpp - Blinker 控制，独立编译避免全局初始化冲突
+#include "config.h"
+#define BLINKER_WIFI
+#include <Blinker.h>
+#include "utility/BlinkerSlider.h"
+
+static BlinkerButton btnStart("btn-start");
+static BlinkerSlider sldTemp("sld-temp");
+static BlinkerSlider sldTime("sld-time");
+static BlinkerNumber numTemp("num-temp");
+static BlinkerText txtState("txt-state");
+static BlinkerNumber numRemain("num-remain");
+static bool inited = false;
+extern float currentTemp;
+extern bool overheatActive;
+extern bool sensorFault;
+extern int remainingSeconds;
+extern String getStateString();
+extern void startDrying();
+extern void stopDrying();
+extern int targetTemp;
+extern int dryTime;
+extern void saveIntParam(const char* key, int value);
+
+void blinkerBtnCb(const String& state) {
+  if (state == BLINKER_CMD_BUTTON_TAP) {
+    if (inited) { startDrying(); } else { stopDrying(); }
+  }
+}
+void blinkerTempCb(int32_t value) { if (value >= 0 && value <= 100) { targetTemp = value; saveIntParam("targetTemp", targetTemp); } }
+void blinkerTimeCb(int32_t value) { if (value >= 1 && value <= 240) { dryTime = value; saveIntParam("dryTime", dryTime); } }
+
+void blinkerSetup(const char* authKey) {
+  btnStart.attach(blinkerBtnCb);
+  sldTemp.attach(blinkerTempCb);
+  sldTime.attach(blinkerTimeCb);
+  Blinker.begin(authKey);
+  inited = true;
+}
+
+void blinkerRun() { if (inited) Blinker.run(); }
+
+void blinkerPush() {
+  if (!inited) return;
+  numTemp.print((int)currentTemp);
+  String st = getStateString(); if (overheatActive) st += " OVERTEMP"; if (sensorFault) st += " FAULT";
+  txtState.print(st); numRemain.print((remainingSeconds + 59) / 60);
+}
+
+bool blinkerIsReady() { return inited; }

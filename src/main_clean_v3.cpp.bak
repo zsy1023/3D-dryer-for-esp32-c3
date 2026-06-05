@@ -1,0 +1,190 @@
+#include "config.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+WebServer server(80);
+Preferences prefs;
+
+float currentTemp = 0.0;
+bool sensorOK = false;
+int sensorFailCount = 0;
+bool sensorFault = false;
+int targetTemp = DEFAULT_TARGET_TEMP;
+int dryTime = DEFAULT_DRY_TIME;
+int remainingSeconds = 0;
+unsigned long dryStartMillis = 0;
+bool overheatActive = false;
+bool heaterRelay = false;
+bool fanRelay = false;
+bool wifiConnected = false;
+SystemState systemState = STATE_STANDBY;
+bool manualMode = false;
+bool manualHeater = false;
+bool manualFan = false;
+unsigned long lastSensorRead = 0;
+unsigned long lastWebHandle = 0;
+
+void initHardware() {
+  pinMode(HEATER_PIN, OUTPUT); pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(HEATER_PIN, LOW); digitalWrite(FAN_PIN, LOW);
+  ds18b20.begin();
+  unsigned long start = millis();
+  while (ds18b20.getDeviceCount() == 0 && millis() - start < 2000) { delay(10); ds18b20.begin(); }
+}
+
+void loadParameters() {
+  prefs.begin("drybox", false);
+  targetTemp = prefs.getInt("target", DEFAULT_TARGET_TEMP);
+  dryTime = prefs.getInt("time", DEFAULT_DRY_TIME);
+  if (targetTemp < 0 || targetTemp > 100) targetTemp = DEFAULT_TARGET_TEMP;
+  if (dryTime < 1 || dryTime > 999) dryTime = DEFAULT_DRY_TIME;
+  prefs.end();
+}
+
+void readTemperature() {
+  ds18b20.requestTemperatures();
+  float temp = ds18b20.getTempCByIndex(0);
+  if (temp == DEVICE_DISCONNECTED_C) { sensorOK = false; sensorFailCount++; }
+  else { currentTemp = temp; sensorOK = true; sensorFailCount = 0; }
+}
+
+void checkSensorFault() { if (!sensorFault && sensorFailCount >= 5) sensorFault = true; }
+void checkOverheatProtection() {
+  if (!sensorOK) return;
+  if (!overheatActive && currentTemp >= OVERHEAT_TRIGGER_TEMP) overheatActive = true;
+  if (overheatActive && currentTemp <= OVERHEAT_RELEASE_TEMP) overheatActive = false;
+}
+
+void setRelays(bool h, bool f) { digitalWrite(HEATER_PIN, h ? HIGH : LOW); digitalWrite(FAN_PIN, f ? HIGH : LOW); heaterRelay = h; fanRelay = f; }
+
+void runStateMachine() {
+  unsigned long now = millis();
+  switch (systemState) {
+    case STATE_STANDBY: setRelays(false, false); remainingSeconds = 0; break;
+    case STATE_DRYING:
+      if (sensorOK) { if (currentTemp < targetTemp - HYSTERESIS) setRelays(true, true); else if (currentTemp > targetTemp + HYSTERESIS) setRelays(false, true); }
+      { unsigned long e = (now - dryStartMillis) / 1000; if (e >= (unsigned long)(dryTime * 60)) { systemState = STATE_COOLING; } else remainingSeconds = (dryTime * 60) - e; } break;
+    case STATE_COOLING: setRelays(false, true); if (sensorOK && currentTemp <= COOLING_TARGET_TEMP) { setRelays(false, false); systemState = STATE_STANDBY; } break;
+  }
+}
+
+void startDrying() { if (!sensorFault && !overheatActive) { systemState = STATE_DRYING; dryStartMillis = millis(); remainingSeconds = dryTime * 60; } }
+void stopDrying() { systemState = STATE_COOLING; }
+
+String getStateString() {
+  if (sensorFault) return "传感器故障";
+  if (overheatActive) return "过热保护中";
+  switch (systemState) { case STATE_STANDBY: return "待机"; case STATE_DRYING: return "烘干中"; case STATE_COOLING: return "散热中"; }
+  return "未知";
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>烘干箱</title><style>";
+  html += "*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px}.c{max-width:480px;margin:0 auto}.card{background:#fff;border-radius:16px;padding:20px;margin-bottom:12px}";
+  html += ".t{font-size:56px;font-weight:bold;text-align:center}.s{text-align:center;font-size:18px;margin:8px 0}.r{text-align:center;font-size:32px;font-weight:bold}.l{font-size:13px;color:#999}";
+  html += ".row{display:flex;gap:12px}.col{flex:1}.inp{width:100%;padding:12px;border:2px solid #ddd;border-radius:10px;font-size:16px}";
+  html += ".btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer;margin:6px 0}";
+  html += ".g{background:#4CAF50;color:#fff}.r2{background:#f44336;color:#fff}";
+  html += ".h{display:none}.al{text-align:center;margin-top:12px}";
+  html += ".sw{position:relative;display:inline-block;width:48px;height:26px;vertical-align:middle;margin-right:8px}";
+  html += ".sw input{opacity:0;width:0;height:0}";
+  html += ".sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;border-radius:26px;transition:.3s}";
+  html += ".sl:before{position:absolute;content:'';height:20px;width:20px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}";
+  html += ".sw input:checked+.sl{background:#2196F3}.sw input:checked+.sl:before{transform:translateX(22px)}";
+  html += "</style></head><body><div class=\"c\">";
+  html += "<div class=\"card\"><div class=\"t\"><span id=\"t\">--</span>&deg;C</div><div class=\"s\"><span id=\"s\">连接中...</span></div>";
+  html += "<div class=\"l\" style=\"margin-top:8px\">剩余时间</div><div class=\"r\" id=\"r\">--:--</div>";
+  html += "<div style=\"margin-top:8px;font-size:14px;color:#666\"><span id=\"st\">--</span>&deg;C &middot; <span id=\"sm\">自动</span> &middot; <span id=\"h\">加热 OFF</span> &middot; <span id=\"f\">风扇 OFF</span><br>";
+  html += "<span id=\"stTask\">待机</span> &middot; 目标 <span id=\"stTarget\">--</span>&deg;C &middot; 设定 <span id=\"stTime\">--</span>分 &middot; 剩余 <span id=\"stRemain\">--</span></div></div>";
+  html += "<div class=\"card\"><div class=\"row\"><div class=\"col\"><div class=\"l\">温度 (&deg;C)</div><input class=\"inp\" type=\"number\" id=\"tt\" min=\"0\" max=\"100\"></div>";
+  html += "<div class=\"col\"><div class=\"l\">时间 (分钟)</div><input class=\"inp\" type=\"number\" id=\"dt\" min=\"1\" max=\"999\"></div></div>";
+  html += "<button class=\"btn g\" id=\"bs\" onclick=\"c('start')\">开始</button><button class=\"btn r2 h\" id=\"bp\" onclick=\"c('stop')\">停止</button></div><div id=\"b\"></div>";
+  html += "<div class=\"card\"><div class=\"l\">手动控制</div><div style=\"margin:12px 0\">";
+  html += "<label class=\"sw\"><input type=\"checkbox\" id=\"mm\"><span class=\"sl\"></span></label><label id=\"ml\" style=\"font-size:14px;color:#666\">无视传感器故障</label></div>";
+  html += "<div id=\"mc\" class=\"h\"><button class=\"btn g\" id=\"mh\" onclick=\"mh(1)\">加热 ON</button><button class=\"btn r2 h\" id=\"mhf\" onclick=\"mh(0)\">加热 OFF</button>";
+  html += "<button class=\"btn\" id=\"mf\" onclick=\"mf(1)\">风扇 ON</button><button class=\"btn r2 h\" id=\"mff\" onclick=\"mf(0)\">风扇 OFF</button></div></div></div>";
+  html += "<script>var mm=document.getElementById('mm');";
+  html += "mm.onchange=function(){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+(mm.checked?1:0)}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})};";
+  html += "function mh(v){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&heater='+v}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})}";
+  html += "function mf(v){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&fan='+v}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})}";
+  html += "function u(d){try{";
+  html += "document.getElementById('t').textContent=d.temp.toFixed(1);";
+  html += "document.getElementById('s').textContent=d.stateStr+(d.fault?' 故障':'')+(d.overheat?' 过热':'');";
+  html += "document.getElementById('r').textContent=d.remainingStr;";
+  html += "document.getElementById('st').textContent=d.temp.toFixed(1);";
+  html += "document.getElementById('sm').textContent=d.manual?'手动':'自动';";
+  html += "document.getElementById('h').textContent=d.heater?'加热 ON':'加热 OFF';";
+  html += "document.getElementById('f').textContent=d.fan?'风扇 ON':'风扇 OFF';";
+  html += "document.getElementById('stTask').textContent=d.stateStr;";
+  html += "document.getElementById('stTarget').textContent=d.targetTemp;";
+  html += "document.getElementById('stTime').textContent=d.dryTime;";
+  html += "document.getElementById('stRemain').textContent=d.remainingStr;";
+  html += "document.getElementById('tt').value=d.targetTemp;document.getElementById('dt').value=d.dryTime;";
+  html += "if(d.state===0||d.fault||d.overheat){document.getElementById('bs').classList.remove('h');document.getElementById('bp').classList.add('h')}";
+  html += "else{document.getElementById('bs').classList.add('h');document.getElementById('bp').classList.remove('h')}";
+  html += "var w='';if(d.fault)w='<div style=\"background:#f8d7da;padding:10px;border-radius:8px;margin-bottom:12px\">传感器故障</div>';";
+  html += "if(d.overheat)w='<div style=\"background:#f44336;color:#fff;padding:10px;border-radius:8px;margin-bottom:12px;font-weight:bold\">&#x26A0; 过热保护中</div>';";
+  html += "document.getElementById('b').innerHTML=w;";
+  html += "mm.checked=d.manual?true:false;";
+  html += "if(d.manual){document.getElementById('mc').classList.remove('h')}else{document.getElementById('mc').classList.add('h')}";
+  html += "var x=document.getElementById('mh'),y=document.getElementById('mhf'),z=document.getElementById('mf'),w=document.getElementById('mff');";
+  html += "if(d.manual){if(d.mHeat){x.classList.add('h');y.classList.remove('h')}else{x.classList.remove('h');y.classList.add('h')}";
+  html += "if(d.mFan){z.classList.add('h');w.classList.remove('h')}else{z.classList.remove('h');w.classList.add('h')}}";
+  html += "}catch(e){}}";
+  html += "function p(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){u(d)}).catch(function(){})}";
+  html += "function c(m){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+m+'&targetTemp='+document.getElementById('tt').value+'&dryTime='+document.getElementById('dt').value}).then(function(r){return r.json()}).then(function(d){if(d.success)p()}).catch(function(){})}";
+  html += "setInterval(p,1000);p();</script></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleStatus() {
+  String s = "{\"temp\":" + String(currentTemp, 1) + ",\"state\":" + String((int)systemState) + ",\"stateStr\":\"" + getStateString() + "\",\"remaining\":" + String(remainingSeconds) + ",\"remainingStr\":\"" + String(remainingSeconds / 60) + ":" + (remainingSeconds % 60 < 10 ? "0" : "") + String(remainingSeconds % 60) + "\",\"targetTemp\":" + String(targetTemp) + ",\"dryTime\":" + String(dryTime) + ",\"heater\":" + String(heaterRelay ? 1 : 0) + ",\"fan\":" + String(fanRelay ? 1 : 0) + ",\"fault\":" + String(sensorFault ? 1 : 0) + ",\"overheat\":" + String(overheatActive ? 1 : 0) + ",\"manual\":" + String(manualMode ? 1 : 0) + ",\"mHeat\":" + String(manualHeater ? 1 : 0) + ",\"mFan\":" + String(manualFan ? 1 : 0) + "}";
+  server.send(200, "application/json", s);
+}
+
+void handleControl() {
+  bool ok = false;
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    if (server.hasArg("targetTemp")) { targetTemp = server.arg("targetTemp").toInt(); prefs.begin("drybox", false); prefs.putInt("target", targetTemp); prefs.end(); }
+    if (server.hasArg("dryTime")) { dryTime = server.arg("dryTime").toInt(); prefs.begin("drybox", false); prefs.putInt("time", dryTime); prefs.end(); }
+    if (cmd == "start") { startDrying(); ok = true; }
+    if (cmd == "stop") { stopDrying(); ok = true; }
+  }
+  server.send(200, "application/json", "{\"success\":" + String(ok ? "true" : "false") + "}");
+}
+
+void handleApiManual() {
+  if (server.hasArg("mode")) {
+    manualMode = server.arg("mode").toInt() ? true : false;
+    if (!manualMode) { manualHeater = false; manualFan = false; }
+  }
+  if (manualMode) {
+    if (server.hasArg("heater")) manualHeater = server.arg("heater").toInt() ? true : false;
+    if (server.hasArg("fan")) manualFan = server.arg("fan").toInt() ? true : false;
+  }
+  server.send(200, "application/json", "{\"manual\":" + String(manualMode ? 1 : 0) + "}");
+}
+
+void setup() {
+  initHardware(); loadParameters();
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  server.on("/", handleRoot); server.on("/api/status", handleStatus); server.on("/api/control", HTTP_POST, handleControl);
+  server.on("/api/manual", HTTP_POST, handleApiManual);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+  if (now - lastSensorRead >= 1000) { readTemperature(); lastSensorRead = now; }
+  checkOverheatProtection(); checkSensorFault();
+  if (overheatActive) { setRelays(false, true); }
+  else if (manualMode) { setRelays(manualHeater, manualFan); }
+  else if (!sensorFault) { runStateMachine(); }
+}

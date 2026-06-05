@@ -1,0 +1,471 @@
+/**
+ * @file main.cpp
+ * @brief 3D 打印耗材烘干箱控制系统（ESP32-C3）
+ *
+ * 功能：
+ *  - DS18B20 温度监测，非阻塞读取
+ *  - 自动控温（滞回逻辑），支持待机/烘干/散热状态
+ *  - Web 服务器，实时状态查看与控制
+ *  - 手动控制模式（传感器故障时强制开关）
+ *  - 过热保护、传感器故障检测
+ *  - 网页内嵌系统日志（桌面端可见）
+ *  - 修改温度/时间即时生效（失焦保存）
+ *  - 网页一键软重启
+ *
+ * 硬件：
+ *  - 加热片继电器 IO4，风扇继电器 IO5（高电平有效）
+ *  - DS18B20 数据引脚 IO13（需要外部 4.7kΩ 上拉电阻）
+ *
+ * 开发环境：VS Code + PlatformIO (Arduino 框架)
+ */
+
+#include "config.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ==================== 全局对象 ====================
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+WebServer server(80);
+Preferences prefs;
+
+// ==================== 全局变量 ====================
+float currentTemp = 0.0;
+bool sensorOK = false;
+int sensorFailCount = 0;
+bool sensorFault = false;
+
+int targetTemp = DEFAULT_TARGET_TEMP;
+int dryTime = DEFAULT_DRY_TIME;
+int remainingSeconds = 0;
+unsigned long dryStartMillis = 0;
+bool overheatActive = false;
+bool heaterRelay = false;
+bool fanRelay = false;
+
+SystemState systemState = STATE_STANDBY;
+bool manualMode = false;
+bool manualHeater = false;
+bool manualFan = false;
+
+unsigned long lastSensorRead = 0;
+
+// ==================== 非阻塞温度读取 ====================
+bool tempRequested = false;
+unsigned long tempRequestTime = 0;
+
+// ==================== 日志系统 ====================
+#define LOG_BUF_SIZE 2048
+static char logBuffer[LOG_BUF_SIZE] = "";
+
+void logMessage(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  char line[256];
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  Serial.print(line);
+  if (strlen(logBuffer) + strlen(line) >= LOG_BUF_SIZE - 10) {
+    char* p = strchr(logBuffer, '\n');
+    if (p) memmove(logBuffer, p + 1, strlen(p + 1) + 1);
+    else logBuffer[0] = '\0';
+  }
+  strcat(logBuffer, line);
+}
+#define LOG(fmt, ...) logMessage(fmt "\n", ##__VA_ARGS__)
+
+// ==================== 硬件初始化 ====================
+void initHardware() {
+  pinMode(HEATER_PIN, OUTPUT); pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(HEATER_PIN, LOW); digitalWrite(FAN_PIN, LOW);
+  ds18b20.begin();
+  unsigned long start = millis();
+  while (ds18b20.getDeviceCount() == 0 && millis() - start < 2000) {
+    delay(10);
+    ds18b20.begin();
+  }
+  if (ds18b20.getDeviceCount() == 0) LOG("[硬件] 未检测到 DS18B20 传感器");
+  else LOG("[硬件] 已检测到 DS18B20 传感器");
+}
+
+// ==================== 参数加载（仅保存温度和时长） ====================
+void loadParameters() {
+  prefs.begin(PREF_NAMESPACE, false);
+  targetTemp = prefs.getInt(PREF_KEY_TARGET_TEMP, DEFAULT_TARGET_TEMP);
+  dryTime = prefs.getInt(PREF_KEY_DRY_TIME, DEFAULT_DRY_TIME);
+  if (targetTemp < 0 || targetTemp > 100) targetTemp = DEFAULT_TARGET_TEMP;
+  if (dryTime < 1 || dryTime > 999) dryTime = DEFAULT_DRY_TIME;
+  prefs.end();
+  LOG("[参数] 目标温度: %d°C, 烘干时间: %d 分钟", targetTemp, dryTime);
+}
+
+// ==================== 非阻塞温度读取 ====================
+void readTemperature() {
+  if (!tempRequested) {
+    ds18b20.requestTemperatures();
+    tempRequested = true;
+    tempRequestTime = millis();
+    return;
+  }
+  if (millis() - tempRequestTime < 750) return;
+  float temp = ds18b20.getTempCByIndex(0);
+  tempRequested = false;
+  if (temp == DEVICE_DISCONNECTED_C) {
+    sensorOK = false;
+    sensorFailCount++;
+    LOG("[传感器] 读取失败 (%d/%d)", sensorFailCount, SENSOR_FAULT_THRESHOLD);
+  } else {
+    currentTemp = temp;
+    sensorOK = true;
+    sensorFailCount = 0;
+    LOG("[传感器] 温度: %.1f°C", currentTemp);
+  }
+}
+
+// ==================== 安全检测 ====================
+void checkSensorFault() {
+  if (!sensorFault && sensorFailCount >= SENSOR_FAULT_THRESHOLD) {
+    sensorFault = true;
+    LOG("[保护] 传感器故障！关闭加热，风扇保持原状");
+  }
+}
+
+void checkOverheatProtection() {
+  if (!sensorOK) return;
+  if (!overheatActive && currentTemp >= OVERHEAT_TRIGGER_TEMP) {
+    overheatActive = true;
+    LOG("[保护] 过热！%.1f°C >= %d°C，强制散热", currentTemp, OVERHEAT_TRIGGER_TEMP);
+  }
+  if (overheatActive && currentTemp <= OVERHEAT_RELEASE_TEMP) {
+    overheatActive = false;
+    LOG("[保护] 过热解除，温度降至 %.1f°C", currentTemp);
+  }
+}
+
+// ==================== 继电器控制 ====================
+void setRelays(bool h, bool f) {
+  digitalWrite(HEATER_PIN, h ? HIGH : LOW);
+  digitalWrite(FAN_PIN, f ? HIGH : LOW);
+  if (h != heaterRelay || f != fanRelay)
+    LOG("[继电器] 加热: %s, 风扇: %s", h ? "ON" : "OFF", f ? "ON" : "OFF");
+  heaterRelay = h;
+  fanRelay = f;
+}
+
+// ==================== 状态机 ====================
+void runStateMachine() {
+  unsigned long now = millis();
+  switch (systemState) {
+    case STATE_STANDBY:
+      setRelays(false, false);
+      remainingSeconds = 0;
+      break;
+    case STATE_DRYING:
+      if (sensorOK) {
+        if (currentTemp < targetTemp - HYSTERESIS) setRelays(true, true);
+        else if (currentTemp > targetTemp + HYSTERESIS) setRelays(false, true);
+      }
+      {
+        unsigned long elapsed = (now - dryStartMillis) / 1000;
+        if (elapsed >= (unsigned long)(dryTime * 60)) {
+          LOG("[状态机] 烘干完成 -> 散热");
+          systemState = STATE_COOLING;
+        } else {
+          remainingSeconds = (dryTime * 60) - elapsed;
+        }
+      }
+      break;
+    case STATE_COOLING:
+      setRelays(false, true);
+      if (sensorOK && currentTemp <= COOLING_TARGET_TEMP) {
+        LOG("[状态机] 散热完成，返回待机");
+        setRelays(false, false);
+        systemState = STATE_STANDBY;
+      }
+      break;
+  }
+}
+
+// ==================== 控制接口 ====================
+void startDrying() {
+  if (!sensorFault && !overheatActive) {
+    systemState = STATE_DRYING;
+    dryStartMillis = millis();
+    remainingSeconds = dryTime * 60;
+    LOG("[控制] 开始烘干，目标 %d°C，时长 %d 分钟", targetTemp, dryTime);
+  } else {
+    LOG("[控制] 无法启动：传感器故障或过热保护中");
+  }
+}
+
+void stopDrying() {
+  if (systemState != STATE_STANDBY) {
+    LOG("[控制] 停止烘干 -> 散热");
+    systemState = STATE_COOLING;
+  }
+}
+
+// ==================== 工具函数 ====================
+String getStateString() {
+  if (sensorFault) return "传感器故障";
+  if (overheatActive) return "过热保护中";
+  switch (systemState) {
+    case STATE_STANDBY: return "待机";
+    case STATE_DRYING:  return "烘干中";
+    case STATE_COOLING: return "散热中";
+  }
+  return "未知";
+}
+
+String formatTime(int sec) {
+  int m = sec / 60;
+  int s = sec % 60;
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+  return String(buf);
+}
+
+String escapeJson(const String& input) {
+  String out = input;
+  out.replace("\\", "\\\\");
+  out.replace("\"", "\\\"");
+  out.replace("\n", "\\n");
+  out.replace("\r", "");
+  return out;
+}
+
+// ==================== Web 处理函数 ====================
+void handleLog() {
+  String json = "{\"log\":\"" + escapeJson(logBuffer) + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void handleStatus() {
+  String s = "{\"temp\":" + String(currentTemp, 1) +
+             ",\"state\":" + String((int)systemState) +
+             ",\"stateStr\":\"" + getStateString() + "\"" +
+             ",\"remaining\":" + String(remainingSeconds) +
+             ",\"remainingStr\":\"" + formatTime(remainingSeconds) + "\"" +
+             ",\"targetTemp\":" + String(targetTemp) +
+             ",\"dryTime\":" + String(dryTime) +
+             ",\"heater\":" + String(heaterRelay ? 1 : 0) +
+             ",\"fan\":" + String(fanRelay ? 1 : 0) +
+             ",\"fault\":" + String(sensorFault ? 1 : 0) +
+             ",\"overheat\":" + String(overheatActive ? 1 : 0) +
+             ",\"manual\":" + String(manualMode ? 1 : 0) +
+             ",\"mHeat\":" + String(manualHeater ? 1 : 0) +
+             ",\"mFan\":" + String(manualFan ? 1 : 0) + "}";
+  server.send(200, "application/json", s);
+}
+
+void handleControl() {
+  bool ok = false;
+  if (server.hasArg("targetTemp")) {
+    targetTemp = server.arg("targetTemp").toInt();
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putInt(PREF_KEY_TARGET_TEMP, targetTemp);
+    prefs.end();
+    LOG("[控制] 目标温度设为 %d°C", targetTemp);
+    ok = true;
+  }
+  if (server.hasArg("dryTime")) {
+    dryTime = server.arg("dryTime").toInt();
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putInt(PREF_KEY_DRY_TIME, dryTime);
+    prefs.end();
+    LOG("[控制] 烘干时间设为 %d 分钟", dryTime);
+    ok = true;
+  }
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    if (cmd == "start") { startDrying(); ok = true; }
+    if (cmd == "stop")  { stopDrying();  ok = true; }
+  }
+  server.send(200, "application/json", "{\"success\":" + String(ok ? "true" : "false") + "}");
+}
+
+void handleManual() {
+  if (server.hasArg("mode")) {
+    manualMode = server.arg("mode").toInt() ? true : false;
+    if (!manualMode) { manualHeater = false; manualFan = false; LOG("[手动] 退出手动控制"); }
+    else { LOG("[手动] 开启手动控制"); }
+  }
+  if (manualMode) {
+    if (server.hasArg("heater")) {
+      manualHeater = server.arg("heater").toInt() ? true : false;
+      LOG("[手动] 加热: %s", manualHeater ? "ON" : "OFF");
+    }
+    if (server.hasArg("fan")) {
+      manualFan = server.arg("fan").toInt() ? true : false;
+      LOG("[手动] 风扇: %s", manualFan ? "ON" : "OFF");
+    }
+  }
+  String s = "{\"manual\":" + String(manualMode ? 1 : 0) +
+             ",\"mHeat\":" + String(manualHeater ? 1 : 0) +
+             ",\"mFan\":" + String(manualFan ? 1 : 0) + "}";
+  server.send(200, "application/json", s);
+}
+
+void handleRestart() {
+  LOG("[系统] 收到软重启请求，即将重启...");
+  server.send(200, "text/plain", "OK");
+  delay(100);
+  ESP.restart();
+}
+
+// ==================== 主页面（无 Blinker 配置入口） ====================
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>烘干箱</title><style>";
+  html += "*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0f2f5;padding:16px}.c{max-width:480px;margin:0 auto}.card{background:#fff;border-radius:16px;padding:20px;margin-bottom:12px}";
+  html += ".t{font-size:56px;font-weight:bold;text-align:center}.s{text-align:center;font-size:18px;margin:8px 0}.r{text-align:center;font-size:32px;font-weight:bold}.l{font-size:13px;color:#999}";
+  html += ".row{display:flex;gap:12px}.col{flex:1}.inp{width:100%;padding:12px;border:2px solid #ddd;border-radius:10px;font-size:16px}";
+  html += ".btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer;margin:6px 0}";
+  html += ".g{background:#4CAF50;color:#fff}.r2{background:#f44336;color:#fff}.b{background:#2196F3;color:#fff}";
+  html += ".h{display:none}.al{text-align:center;margin-top:12px}.al a{color:#f44336}";
+  html += ".sw{position:relative;display:inline-block;width:48px;height:26px;vertical-align:middle;margin-right:8px}";
+  html += ".sw input{opacity:0;width:0;height:0}";
+  html += ".sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;border-radius:26px;transition:.3s}";
+  html += ".sl:before{position:absolute;content:'';height:20px;width:20px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}";
+  html += ".sw input:checked+.sl{background:#2196F3}";
+  html += ".sw input:checked+.sl:before{transform:translateX(22px)}";
+  html += "@media (max-width:768px){.log-panel{display:none}}";
+  html += "</style></head><body><div class=\"c\">";
+  // 状态卡片
+  html += "<div class=\"card\"><div class=\"t\"><span id=\"t\">--</span>&deg;C</div><div class=\"s\"><span id=\"s\">连接中...</span></div>";
+  html += "<div class=\"l\" style=\"margin-top:8px\">剩余时间</div><div class=\"r\" id=\"r\">--:--</div>";
+  html += "<div style=\"margin-top:8px;font-size:14px;color:#666\"><span id=\"st\">--</span>&deg;C &middot; <span id=\"sm\">自动</span> &middot; <span id=\"h\">加热 OFF</span> &middot; <span id=\"f\">风扇 OFF</span><br><span id=\"stTask\">待机</span> &middot; 目标 <span id=\"stTarget\">--</span>&deg;C &middot; 设定 <span id=\"stTime\">--</span>分 &middot; 剩余 <span id=\"stRemain\">--</span></div></div>";
+  // 控制卡片
+  html += "<div class=\"card\"><div class=\"row\"><div class=\"col\"><div class=\"l\">温度 (&deg;C)</div><input class=\"inp\" type=\"number\" id=\"tt\" min=\"0\" max=\"100\" onchange=\"saveTemp()\"></div>";
+  html += "<div class=\"col\"><div class=\"l\">时间 (分钟)</div><input class=\"inp\" type=\"number\" id=\"dt\" min=\"1\" max=\"999\" onchange=\"saveTime()\"></div></div>";
+  html += "<button class=\"btn g\" id=\"bs\" onclick=\"c('start')\">开始</button><button class=\"btn r2 h\" id=\"bp\" onclick=\"c('stop')\">停止</button></div><div id=\"b\"></div>";
+  // 手动控制卡片
+  html += "<div class=\"card\"><div class=\"l\">手动控制</div><div style=\"margin:12px 0\">";
+  html += "<label class=\"sw\"><input type=\"checkbox\" id=\"mm\"><span class=\"sl\"></span></label><label style=\"font-size:14px;color:#666\">无视传感器故障</label></div>";
+  html += "<div id=\"mc\" class=\"h\"><button class=\"btn g\" id=\"mh\" onclick=\"mh(1)\">加热 ON</button><button class=\"btn r2 h\" id=\"mhf\" onclick=\"mh(0)\">加热 OFF</button>";
+  html += "<button class=\"btn b\" id=\"mf\" onclick=\"mf(1)\">风扇 ON</button><button class=\"btn r2 h\" id=\"mff\" onclick=\"mf(0)\">风扇 OFF</button></div></div>";
+  // 日志面板（桌面端）
+  html += "<div class=\"log-panel\"><div class=\"card\"><div class=\"l\" style=\"margin-bottom:8px\">🔍 系统日志</div>";
+  html += "<pre id=\"logBox\" style=\"background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;font-size:12px;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all\"></pre></div></div>";
+  // 底部链接：只有重启，没有配置
+  html += "<div class=\"al\"><a href=\"#\" onclick=\"restartDevice()\">重启设备</a></div></div>";
+
+  html += "<script>";
+  html += "var _ignoreTempUpdate=false; var _ignoreTimeUpdate=false;";
+  html += "var mm=document.getElementById('mm');";
+  html += "mm.onchange=function(){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+(mm.checked?1:0)}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})};";
+  html += "function mh(v){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&heater='+v}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})}";
+  html += "function mf(v){fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode=1&fan='+v}).then(function(r){return r.json()}).then(function(){p()}).catch(function(){})}";
+
+  html += "function saveTemp(){";
+  html += "var v=document.getElementById('tt').value; _ignoreTempUpdate=true;";
+  html += "fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'targetTemp='+v})";
+  html += ".then(function(r){return r.json()}).then(function(d){_ignoreTempUpdate=false;if(d.success)p();}).catch(function(){_ignoreTempUpdate=false;});";
+  html += "}";
+
+  html += "function saveTime(){";
+  html += "var v=document.getElementById('dt').value; _ignoreTimeUpdate=true;";
+  html += "fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'dryTime='+v})";
+  html += ".then(function(r){return r.json()}).then(function(d){_ignoreTimeUpdate=false;if(d.success)p();}).catch(function(){_ignoreTimeUpdate=false;});";
+  html += "}";
+
+  html += "function u(d){try{";
+  html += "document.getElementById('t').textContent=d.temp.toFixed(1);";
+  html += "document.getElementById('s').textContent=d.stateStr+(d.fault?' 故障':'')+(d.overheat?' 过热':'');";
+  html += "document.getElementById('r').textContent=d.remainingStr;";
+  html += "document.getElementById('st').textContent=d.temp.toFixed(1);";
+  html += "document.getElementById('sm').textContent=d.manual?'手动':'自动';";
+  html += "document.getElementById('h').textContent=d.heater?'加热 ON':'加热 OFF';";
+  html += "document.getElementById('f').textContent=d.fan?'风扇 ON':'风扇 OFF';";
+  html += "document.getElementById('stTask').textContent=d.stateStr;";
+  html += "document.getElementById('stTarget').textContent=d.targetTemp;";
+  html += "document.getElementById('stTime').textContent=d.dryTime;";
+  html += "document.getElementById('stRemain').textContent=d.remainingStr;";
+  html += "if(!_ignoreTempUpdate && document.activeElement!==document.getElementById('tt')) document.getElementById('tt').value=d.targetTemp;";
+  html += "if(!_ignoreTimeUpdate && document.activeElement!==document.getElementById('dt')) document.getElementById('dt').value=d.dryTime;";
+  html += "if(d.state===0||d.fault||d.overheat){document.getElementById('bs').classList.remove('h');document.getElementById('bp').classList.add('h')}";
+  html += "else{document.getElementById('bs').classList.add('h');document.getElementById('bp').classList.remove('h')}";
+  html += "var w='';if(d.fault)w='<div style=\"background:#f8d7da;padding:10px;border-radius:8px;margin-bottom:12px\">传感器故障</div>';";
+  html += "if(d.overheat)w='<div style=\"background:#f44336;color:#fff;padding:10px;border-radius:8px;margin-bottom:12px;font-weight:bold\">&#x26A0; 过热保护中</div>';";
+  html += "document.getElementById('b').innerHTML=w;";
+  html += "mm.checked=d.manual?true:false;";
+  html += "if(d.manual){document.getElementById('mc').classList.remove('h')}else{document.getElementById('mc').classList.add('h')}";
+  html += "var x=document.getElementById('mh'),y=document.getElementById('mhf'),z=document.getElementById('mf'),w=document.getElementById('mff');";
+  html += "if(d.manual){if(d.mHeat){x.classList.add('h');y.classList.remove('h')}else{x.classList.remove('h');y.classList.add('h')}";
+  html += "if(d.mFan){z.classList.add('h');w.classList.remove('h')}else{z.classList.remove('h');w.classList.add('h')}}";
+  html += "}catch(e){}}";
+
+  html += "function p(){fetch('/api/status').then(function(r){return r.json()}).then(function(d){u(d)}).catch(function(){})}";
+  html += "function c(m){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+m+'&targetTemp='+document.getElementById('tt').value+'&dryTime='+document.getElementById('dt').value}).then(function(r){return r.json()}).then(function(d){if(d.success)p()}).catch(function(){})}";
+  html += "function updateLogs(){fetch('/api/log').then(function(r){return r.json()}).then(function(d){document.getElementById('logBox').textContent=d.log;}).catch(function(){})}";
+  html += "function restartDevice(){if(confirm('确认重启设备？')){fetch('/api/restart',{method:'POST'}).then(function(){alert('重启中...');}).catch(function(){alert('重启请求失败');})}}";
+  html += "setInterval(p,1000);p();setInterval(updateLogs,1000);updateLogs();</script></body></html>";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  LOG("--- 系统启动 ---");
+
+  initHardware();
+  loadParameters();
+
+  LOG("正在连接 WiFi: %s ...", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 40) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    LOG("\nWiFi 连接成功！");
+    LOG("IP 地址: %s", WiFi.localIP().toString().c_str());
+  } else {
+    LOG("\nWiFi 连接失败！请检查 SSID 和密码，或路由器设置。");
+  }
+
+  // 注册路由（无 Blinker 相关）
+  server.on("/", handleRoot);
+  server.on("/api/status", handleStatus);
+  server.on("/api/control", HTTP_POST, handleControl);
+  server.on("/api/manual", HTTP_POST, handleManual);
+  server.on("/api/log", handleLog);
+  server.on("/api/restart", HTTP_POST, handleRestart);
+  server.begin();
+
+  LOG("[系统] 初始化完成");
+}
+
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  if (now - lastSensorRead >= 1000 && !tempRequested) {
+    readTemperature();
+    lastSensorRead = now;
+  }
+  if (tempRequested) {
+    readTemperature();
+  }
+
+  checkOverheatProtection();
+  checkSensorFault();
+
+  if (overheatActive) {
+    setRelays(false, true);
+  } else if (manualMode) {
+    setRelays(manualHeater, manualFan);
+  } else if (!sensorFault) {
+    runStateMachine();
+  } else {
+    setRelays(false, fanRelay);
+  }
+}

@@ -1,0 +1,57 @@
+// ============================================================
+// config.h — 3D打印耗材烘干箱控制系统 配置文件
+// 主控芯片: ESP32-C3
+// ============================================================
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// ==================== Blinker（点灯科技） ====================
+// Blinker 已移除——该库与 ESP32-C3（RISC-V）不兼容
+// #define BLINKER_ENABLED
+
+// ==================== 引脚定义 ====================
+#define HEATER_PIN      4       // 加热片继电器 — IO4（高电平触发）
+#define FAN_PIN         5       // 12V风扇继电器 — IO5（高电平触发）
+#define DS18B20_PIN     13      // DS18B20 数据引脚 — IO13（使用ESP32内部上拉）
+
+// ==================== WiFi 配置 ====================
+#define WIFI_SSID       "hs10000"
+#define WIFI_PASS       "kazikazi@123"
+
+// ==================== 默认控制参数 ====================
+#define DEFAULT_TARGET_TEMP     60      // 默认目标温度 (℃)
+#define DEFAULT_DRY_TIME        120     // 默认烘干时间 (分钟)
+#define HYSTERESIS              3       // 滞回比较回差 (℃)
+
+// ==================== 安全保护参数 ====================
+#define OVERHEAT_TRIGGER_TEMP   95      // 过热触发温度 (℃) — 达到此温度强制散热
+#define OVERHEAT_RELEASE_TEMP   70      // 过热解除温度 (℃) — 降至该值解除保护
+#define COOLING_TARGET_TEMP     35      // 散热目标温度 (℃) — 降至该值转待机
+#define SENSOR_FAULT_THRESHOLD  5       // 传感器连续读取失败次数阈值
+
+// ==================== 时间间隔参数 (ms) ====================
+#define SENSOR_READ_INTERVAL    1000    // 传感器读取间隔 (1秒/次)
+#define BLINKER_PUSH_INTERVAL   2000    // Blinker推送间隔 (2秒/次)
+#define WEB_CHECK_INTERVAL      50      // Web服务器轮询间隔
+
+// ==================== Preferences 存储键名 ====================
+#define PREF_NAMESPACE          "dryingbox"
+#define PREF_KEY_TARGET_TEMP    "targetTemp"
+#define PREF_KEY_DRY_TIME       "dryTime"
+#define PREF_KEY_BLINKER_AUTH   "blinkerAuth"
+
+// ==================== 状态机枚举 ====================
+enum SystemState {
+    STATE_STANDBY = 0,      // 待机 — 加热关、风扇关
+    STATE_DRYING = 1,       // 烘干 — 风扇常开、加热片按滞回逻辑通断、倒计时
+    STATE_COOLING = 2       // 散热 — 加热关、风扇开、等待降温
+};
+
+// ==================== 状态文字描述 ====================
+static const char* STATE_STR[] = {
+    "待机",
+    "烘干中",
+    "散热降温中"
+};
+
+#endif // CONFIG_H
